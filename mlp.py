@@ -7,9 +7,9 @@ from time import time
 
 import numpy as np
 import tensorflow as tf
+from sklearn.impute import SimpleImputer
 from sklearn.mixture import GaussianMixture
 from sklearn.model_selection import StratifiedKFold
-from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import LabelBinarizer
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -33,18 +33,25 @@ def scaler_range(X, feature_range=(-1, 1), min_x=None, max_x=None):
     return X_scaled, min_x, max_x
 
 
-def nr(w):
-    return tf.div(tf.exp(tf.div(-tf.pow(w, 2), 2.)), np.sqrt(2 * np.pi)) + tf.multiply(tf.div(w, 2.), 1 + tf.erf(
-        tf.div(w, np.sqrt(2))))
+def nr(mu, sigma):
+    non_zero = tf.not_equal(sigma, 0.)
+    new_sigma = tf.where(non_zero, sigma, tf.fill(tf.shape(sigma), 1e-20))
+    sqrt_sigma = tf.sqrt(new_sigma)
+
+    w = tf.div(mu, sqrt_sigma)
+    nr_values = sqrt_sigma * (tf.div(tf.exp(tf.div(-tf.square(w), 2.)), np.sqrt(2 * np.pi)) +
+                              tf.multiply(tf.div(w, 2.), 1 + tf.erf(tf.div(w, np.sqrt(2)))))
+
+    nr_values = tf.where(non_zero, nr_values, (mu - tf.abs(mu)) / 2.)
+    return nr_values
 
 
 # Create model
-def multilayer_perceptron(x, means, covs, p, gamma, n_distribution, weights, biases, num_hidden_1):
-    gamma = tf.abs(gamma)
-    gamma = tf.cond(tf.less(gamma[0], 1.), lambda: gamma, lambda: tf.pow(gamma, 2))
-    covs = tf.abs(covs)
-    p = tf.abs(p)
-    p = tf.div(p, tf.reduce_sum(p, axis=0))
+def multilayer_perceptron(x, means, covs, p, gamma, n_distribution, weights, biases):
+    gamma_ = tf.abs(gamma)
+    # gamma_ = tf.cond(tf.less(gamma_[0], 1.), lambda: gamma_, lambda: tf.square(gamma_))
+    covs_ = tf.abs(covs)
+    p_ = tf.nn.softmax(p)
 
     check_isnan = tf.is_nan(x)
     check_isnan = tf.reduce_sum(tf.cast(check_isnan, tf.int32), 1)
@@ -62,29 +69,25 @@ def multilayer_perceptron(x, means, covs, p, gamma, n_distribution, weights, bia
 
     weights2 = tf.square(weights['h1'])
 
-    Q = []
-    layer_1_miss = tf.zeros([size[0], num_hidden_1])
-    for i in range(n_distribution):
+    # Collect distributions
+    distributions = tf.TensorArray(dtype=x.dtype, size=n_distribution)
+    q_collector = tf.TensorArray(dtype=x.dtype, size=n_distribution)
+
+    # Each loop iteration calculates all per component
+    def calculate_component(i, collect1, collect2):
         data_miss = tf.where(where_isnan, tf.reshape(tf.tile(means[i, :], [size[0]]), [-1, size[1]]), x_miss)
-        miss_cov = tf.where(where_isnan, tf.reshape(tf.tile(covs[i, :], [size[0]]), [-1, size[1]]),
+        miss_cov = tf.where(where_isnan, tf.reshape(tf.tile(covs_[i, :], [size[0]]), [-1, size[1]]),
                             tf.zeros([size[0], size[1]]))
 
         layer_1_m = tf.add(tf.matmul(data_miss, weights['h1']), biases['b1'])
+        layer_1_m = nr(layer_1_m, tf.matmul(miss_cov, weights2))
 
-        layer_1_m = tf.div(layer_1_m, tf.sqrt(tf.matmul(miss_cov, weights2)))
-        layer_1_m = nr(layer_1_m)
-
-        layer_1_miss = tf.cond(tf.equal(tf.constant(i), tf.constant(0)), lambda: tf.add(layer_1_miss, layer_1_m),
-                               lambda: tf.concat((layer_1_miss, layer_1_m), axis=0))
-
-        # calculate q_i
         norm = tf.subtract(data_miss, means[i, :])
         norm = tf.square(norm)
         q = tf.where(where_isfinite,
-                     tf.reshape(tf.tile(tf.add(gamma, covs[i, :]), [size[0]]), [-1, size[1]]),
+                     tf.reshape(tf.tile(tf.add(gamma_, covs_[i, :]), [size[0]]), [-1, size[1]]),
                      tf.ones_like(x_miss))
         norm = tf.div(norm, q)
-
         norm = tf.reduce_sum(norm, axis=1)
 
         q = tf.log(q)
@@ -96,23 +99,25 @@ def multilayer_perceptron(x, means, covs, p, gamma, n_distribution, weights, bia
         norm = tf.multiply(norm, tf.log(2 * np.pi))
 
         q = tf.add(q, norm)
-        q = tf.multiply(q, -0.5)
+        q = -0.5 * q
 
-        Q = tf.concat((Q, q), axis=0)
+        return i + 1, collect1.write(i, layer_1_m), collect2.write(i, q)
 
-    Q = tf.reshape(Q, shape=(n_distribution, -1))
-    Q = tf.add(Q, tf.log(p))
-    Q = tf.subtract(Q, tf.reduce_max(Q, axis=0))
-    Q = tf.where(Q < -20, tf.multiply(tf.ones_like(Q), -20), Q)
-    Q = tf.exp(Q)
-    Q = tf.div(Q, tf.reduce_sum(Q, axis=0))
-    Q = tf.reshape(Q, shape=(-1, 1))
+    i = tf.constant(0)
+    _, final_distributions, final_q = tf.while_loop(lambda i, c1, c2: i < n_distribution, calculate_component,
+                                                    loop_vars=(i, distributions, q_collector),
+                                                    swap_memory=True, parallel_iterations=1)
 
-    layer_1_miss = tf.multiply(layer_1_miss, Q)
-    layer_1_miss = tf.reshape(layer_1_miss, shape=(n_distribution, size[0], num_hidden_1))
+    distrib = final_distributions.stack()
+    log_q = final_q.stack()
+
+    log_q = tf.add(log_q, tf.log(p_))
+    r = tf.nn.softmax(log_q, axis=0)
+
+    layer_1_miss = tf.multiply(distrib, r[:, :, tf.newaxis])
     layer_1_miss = tf.reduce_sum(layer_1_miss, axis=0)
 
-    # join layer for data with missing values with layer for data without missing values
+    # join layer for data_rbfn with missing values with layer for data_rbfn without missing values
     layer_1 = tf.concat((layer_1, layer_1_miss), axis=0)
 
     # Encoder Hidden layer with sigmoid activation
@@ -150,10 +155,10 @@ def main():
     # Network Parameters
     n_distribution = FLAGS.n_distribution
 
-    data = read_data(os.path.join(path_dir, 'data.txt'))
+    data = read_data(os.path.join(path_dir, '_data.txt'))
     data, minx, maxx = scaler_range(data, feature_range=(-1, 1))
 
-    labels = read_data(os.path.join(path_dir, 'labels.txt'))
+    labels = read_data(os.path.join(path_dir, '_labels.txt'))
     lb = LabelBinarizer()
     lb.fit(labels)
 
@@ -175,7 +180,7 @@ def main():
     gmm = GaussianMixture(n_components=n_distribution, covariance_type='diag').fit(complate_data)
     del complate_data, imp
 
-    gmm_weights = gmm.weights_.reshape((-1, 1))
+    gmm_weights = np.log(gmm.weights_.reshape((-1, 1)))
     gmm_means = gmm.means_
     gmm_covariances = gmm.covariances_
     del gmm
@@ -234,7 +239,7 @@ def main():
             gamma = tf.Variable(initial_value=tf.random_normal(shape=(1,), mean=2, stddev=1.), dtype=tf.float32)
 
             # Construct model
-            predict = multilayer_perceptron(z, means, covs, p, gamma, n_distribution, weights, biases, num_hidden_1)
+            predict = multilayer_perceptron(z, means, covs, p, gamma, n_distribution, weights, biases)
 
             y_true = prep_labels(z, y)
 
@@ -328,11 +333,17 @@ def main():
                         optimizer = tf.train.GradientDescentOptimizer(l_r).minimize(cost)
                     elif n_cost_up == 10:
                         break
-                        
+
                 time_train[id_acc] = (time() - time_train[id_acc]) / (epoch + 1)
 
-                predict = multilayer_perceptron(z, val_means, val_covs, val_p, val_gamma, n_distribution,
-                                                val_weights, val_biases, num_hidden_1)
+                means.load(val_means)
+                covs.load(val_covs)
+                p.load(val_p)
+                gamma.load(val_gamma)
+                for key in weights.keys():
+                    weights[key].load(val_weights[key])
+                for key in biases.keys():
+                    biases[key].load(val_biases[key])
 
                 correct_prediction = tf.equal(tf.argmax(y, 1), tf.argmax(predict, 1))
                 accuracy = tf.reduce_mean(tf.cast(correct_prediction, tf.float32))

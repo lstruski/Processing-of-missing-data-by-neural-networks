@@ -1,6 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
 import os
 import pathlib
 import sys
@@ -9,8 +6,8 @@ from time import time
 import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
+from sklearn.impute import SimpleImputer
 from sklearn.mixture import GaussianMixture
-from sklearn.preprocessing import Imputer
 from tensorflow.examples.tutorials.mnist import input_data
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -82,18 +79,24 @@ def data_with_mask(x, width_window=10):
     return x
 
 
-def nr(w):
-    return tf.div(tf.exp(tf.div(-tf.pow(w, 2), 2.)), np.sqrt(2 * np.pi)) + tf.multiply(tf.div(w, 2.), 1 + tf.erf(
-        tf.div(w, np.sqrt(2))))
+def nr(mu, sigma):
+    non_zero = tf.not_equal(sigma, 0.)
+    new_sigma = tf.where(non_zero, sigma, tf.fill(tf.shape(sigma), 1e-20))
+    sqrt_sigma = tf.sqrt(new_sigma)
+
+    w = tf.div(mu, sqrt_sigma)
+    nr_values = sqrt_sigma * (tf.div(tf.exp(tf.div(-tf.square(w), 2.)), np.sqrt(2 * np.pi)) +
+                              tf.multiply(tf.div(w, 2.), 1 + tf.erf(tf.div(w, np.sqrt(2)))))
+
+    nr_values = tf.where(non_zero, nr_values, (mu - tf.abs(mu)) / 2.)
+    return nr_values
 
 
-# Building the encoder
-def encoder(x, means, covs, p, gamma):
-    gamma = tf.abs(gamma)
-    gamma_ = tf.cond(tf.less(gamma[0], 1.), lambda: gamma, lambda: tf.pow(gamma, 2))
-    covs = tf.abs(covs)
-    p = tf.abs(p)
-    p = tf.div(p, tf.reduce_sum(p, axis=0))
+def conv_first(x, means, covs, p, gamma):
+    gamma_ = tf.abs(gamma)
+    # gamma_ = tf.cond(tf.less(gamma_[0], 1.), lambda: gamma_, lambda: tf.square(gamma_))
+    covs_ = tf.abs(covs)
+    p_ = tf.nn.softmax(p)
 
     check_isnan = tf.is_nan(x)
     check_isnan = tf.reduce_sum(tf.cast(check_isnan, tf.int32), 1)
@@ -111,25 +114,23 @@ def encoder(x, means, covs, p, gamma):
 
     weights2 = tf.square(weights['encoder_h1'])
 
-    Q = []
-    layer_1_miss = tf.zeros([size[0], num_hidden_1])
-    for i in range(n_distribution):
+    # Collect distributions
+    distributions = tf.TensorArray(dtype=x.dtype, size=n_distribution)
+    q_collector = tf.TensorArray(dtype=x.dtype, size=n_distribution)
+
+    # Each loop iteration calculates all per component
+    def calculate_component(i, collect1, collect2):
         data_miss = tf.where(where_isnan, tf.reshape(tf.tile(means[i, :], [size[0]]), [-1, size[1]]), x_miss)
-        miss_cov = tf.where(where_isnan, tf.reshape(tf.tile(covs[i, :], [size[0]]), [-1, size[1]]),
+        miss_cov = tf.where(where_isnan, tf.reshape(tf.tile(covs_[i, :], [size[0]]), [-1, size[1]]),
                             tf.zeros([size[0], size[1]]))
 
         layer_1_m = tf.add(tf.matmul(data_miss, weights['encoder_h1']), biases['encoder_b1'])
-
-        layer_1_m = tf.div(layer_1_m, tf.sqrt(tf.matmul(miss_cov, weights2)))
-        layer_1_m = nr(layer_1_m)
-
-        layer_1_miss = tf.cond(tf.equal(tf.constant(i), tf.constant(0)), lambda: tf.add(layer_1_miss, layer_1_m),
-                               lambda: tf.concat((layer_1_miss, layer_1_m), axis=0))
+        layer_1_m = nr(layer_1_m, tf.matmul(miss_cov, weights2))
 
         norm = tf.subtract(data_miss, means[i, :])
         norm = tf.square(norm)
         q = tf.where(where_isfinite,
-                     tf.reshape(tf.tile(tf.add(gamma_, covs[i, :]), [size[0]]), [-1, size[1]]),
+                     tf.reshape(tf.tile(tf.add(gamma_, covs_[i, :]), [size[0]]), [-1, size[1]]),
                      tf.ones_like(x_miss))
         norm = tf.div(norm, q)
         norm = tf.reduce_sum(norm, axis=1)
@@ -143,24 +144,32 @@ def encoder(x, means, covs, p, gamma):
         norm = tf.multiply(norm, tf.log(2 * np.pi))
 
         q = tf.add(q, norm)
-        q = tf.multiply(q, -0.5)
+        q = -0.5 * q
 
-        Q = tf.concat((Q, q), axis=0)
+        return i + 1, collect1.write(i, layer_1_m), collect2.write(i, q)
 
-    Q = tf.reshape(Q, shape=(n_distribution, -1))
-    Q = tf.add(Q, tf.log(p))
-    Q = tf.subtract(Q, tf.reduce_max(Q, axis=0))
-    Q = tf.where(Q < -20, tf.multiply(tf.ones_like(Q), -20), Q)
-    Q = tf.exp(Q)
-    Q = tf.div(Q, tf.reduce_sum(Q, axis=0))
-    Q = tf.reshape(Q, shape=(-1, 1))
+    i = tf.constant(0)
+    _, final_distributions, final_q = tf.while_loop(lambda i, c1, c2: i < n_distribution, calculate_component,
+                                                    loop_vars=(i, distributions, q_collector),
+                                                    swap_memory=True, parallel_iterations=1)
 
-    layer_1_miss = tf.multiply(layer_1_miss, Q)
-    layer_1_miss = tf.reshape(layer_1_miss, shape=(n_distribution, size[0], num_hidden_1))
+    distrib = final_distributions.stack()
+    log_q = final_q.stack()
+
+    log_q = tf.add(log_q, tf.log(p_))
+    r = tf.nn.softmax(log_q, axis=0)
+
+    layer_1_miss = tf.multiply(distrib, r[:, :, tf.newaxis])
     layer_1_miss = tf.reduce_sum(layer_1_miss, axis=0)
 
     # join layer for data_rbfn with missing values with layer for data_rbfn without missing values
     layer_1 = tf.concat((layer_1, layer_1_miss), axis=0)
+    return layer_1
+
+
+# Building the encoder
+def encoder(x, means, covs, p, gamma):
+    layer_1 = conv_first(x, means, covs, p, gamma)
 
     # Encoder Hidden layer with sigmoid activation
     layer_2 = tf.nn.sigmoid(tf.add(tf.matmul(layer_1, weights['encoder_h2']), biases['encoder_b2']))
@@ -186,24 +195,25 @@ def prep_x(x):
 
 
 t0 = time()
-mnist = input_data.read_data_sets("./data_mnist/", one_hot=True)
-print("Read data_rbfn done in %0.3fs." % (time() - t0))
+mnist = tf.keras.datasets.mnist
+(x_train, y_train), (x_test, y_test) = mnist.load_data()
+x_train, x_test = x_train / 255.0, x_test / 255.0
+print("Read data done in %0.3fs." % (time() - t0))
 
-data_train = mnist.train.images
+data_train = x_train
 
 # choose test images nn * 10
 nn = 100
-labels = np.where(mnist.test.labels == 1)[1]
-data_test = mnist.test.images[np.where(labels == 0)[0][:nn], :]
+data_test = x_test[np.where(y_test == 0)[0][:nn], :]
 for i in range(1, 10):
-    data_test = np.concatenate([data_test, mnist.test.images[np.where(labels == i)[0][:nn], :]], axis=0)
+    data_test = np.concatenate([data_test, x_test[np.where(y_test == i)[0][:nn], :]], axis=0)
 data_test = np.random.permutation(data_test)
 
-del mnist, labels
+del mnist
 
 # change background to white
-data_train = 1. - data_train
-data_test = 1. - data_test
+data_train = 1. - data_train.reshape(-1, num_input)
+data_test = 1. - data_test.reshape(-1, num_input)
 
 # create missing data_rbfn train
 data_train = data_with_mask(data_train, width_mask)
@@ -211,14 +221,14 @@ data_train = data_with_mask(data_train, width_mask)
 # create missing data_rbfn test
 data_test = data_with_mask(data_test, width_mask)
 
-imp = Imputer(missing_values="NaN", strategy="mean", axis=0)
+imp = SimpleImputer(missing_values=np.nan, strategy='mean')
 data = imp.fit_transform(data_train)
 
 t0 = time()
 gmm = GaussianMixture(n_components=n_distribution, covariance_type='diag').fit(data)
 print("GMM done in %0.3fs." % (time() - t0))
 
-p = tf.Variable(initial_value=gmm.weights_.reshape((-1, 1)), dtype=tf.float32)
+p = tf.Variable(initial_value=np.log(gmm.weights_.reshape((-1, 1))), dtype=tf.float32)
 means = tf.Variable(initial_value=gmm.means_, dtype=tf.float32)
 covs = tf.Variable(initial_value=gmm.covariances_, dtype=tf.float32)
 gamma = tf.Variable(initial_value=tf.random_normal(shape=(1,), mean=1., stddev=1.), dtype=tf.float32)

@@ -6,9 +6,9 @@ import sys
 
 import numpy as np
 import tensorflow as tf
+from sklearn.impute import SimpleImputer
 from sklearn.mixture import GaussianMixture
 from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import Imputer
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
@@ -36,12 +36,11 @@ def init_weights(shape):
 
 
 # Create model
-def neural_net(data, weights_, means_, covs_, s_, x_, w_, gamma, n_d, n_h):
-    gamma = tf.abs(gamma)
-    s_ = tf.abs(s_)
-    weights_ = tf.abs(weights_)
-    weights_ = tf.div(weights_, tf.reduce_sum(weights_, axis=0))
-    covs_ = tf.abs(covs_)
+def neural_net(data, weights, means_, covs, s, x_, w_, gamma, n_d, n_h):
+    gamma_ = tf.abs(gamma)
+    s_ = tf.abs(s)
+    weights_ = tf.nn.softmax(weights)
+    covs_ = tf.abs(covs)
 
     where_isnan = tf.is_nan(data)
     where_isfinite = tf.is_finite(data)
@@ -56,7 +55,7 @@ def neural_net(data, weights_, means_, covs_, s_, x_, w_, gamma, n_d, n_h):
         norm = tf.subtract(new_data, means_[n_comp, :])
         norm = tf.square(norm)
         q = tf.where(where_isfinite,
-                     tf.reshape(tf.tile(tf.add(gamma, covs_[n_comp, :]), [size[0]]), [-1, size[1]]),
+                     tf.reshape(tf.tile(tf.add(gamma_, covs_[n_comp, :]), [size[0]]), [-1, size[1]]),
                      tf.ones_like(data))
         norm = tf.div(norm, q)
 
@@ -96,10 +95,7 @@ def neural_net(data, weights_, means_, covs_, s_, x_, w_, gamma, n_d, n_h):
 
     Q = tf.reshape(Q, shape=(n_d, -1))
     Q = tf.add(Q, tf.log(weights_))
-    Q = tf.subtract(Q, tf.reduce_max(Q, axis=0))
-    Q = tf.where(Q < -20, tf.multiply(tf.ones_like(Q), -20), Q)
-    Q = tf.exp(Q)
-    Q = tf.div(Q, tf.reduce_sum(Q, axis=0))
+    Q = tf.nn.softmax(Q, axis=0)
 
     Q = tf.transpose(Q)
     Q = tf.tile(Q, [n_h, 1])
@@ -143,7 +139,7 @@ def main():
 
     n_features = data.shape[1]
 
-    imp = Imputer(missing_values="NaN", strategy="mean", axis=0)
+    imp = SimpleImputer(missing_values=np.nan, strategy='mean')
 
     complate_data = imp.fit_transform(data)
     gmm = GaussianMixture(n_components=n_distribution, covariance_type='diag').fit(complate_data)
@@ -151,7 +147,7 @@ def main():
     mean_sel = complate_data[np.random.choice(complate_data.shape[0], size=n_hidden_1, replace=True), :]
     del complate_data, imp
 
-    gmm_weights = gmm.weights_.reshape((-1, 1))
+    gmm_weights = np.log(gmm.weights_.reshape((-1, 1)))
     gmm_means = gmm.means_
     gmm_covariances = gmm.covariances_
 
