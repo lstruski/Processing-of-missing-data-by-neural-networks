@@ -39,7 +39,7 @@ def init_weights(shape):
 def neural_net(data, weights, means_, covs, s, x_, w_, gamma, n_d, n_h):
     gamma_ = tf.abs(gamma)
     s_ = tf.abs(s)
-    weights_ = tf.nn.softmax(weights)
+    weights_ = tf.nn.softmax(weights, axis=0)
     covs_ = tf.abs(covs)
 
     where_isnan = tf.is_nan(data)

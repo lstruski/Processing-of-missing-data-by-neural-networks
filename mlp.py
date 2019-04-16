@@ -51,7 +51,7 @@ def multilayer_perceptron(x, means, covs, p, gamma, n_distribution, weights, bia
     gamma_ = tf.abs(gamma)
     # gamma_ = tf.cond(tf.less(gamma_[0], 1.), lambda: gamma_, lambda: tf.square(gamma_))
     covs_ = tf.abs(covs)
-    p_ = tf.nn.softmax(p)
+    p_ = tf.nn.softmax(p, axis=0)
 
     check_isnan = tf.is_nan(x)
     check_isnan = tf.reduce_sum(tf.cast(check_isnan, tf.int32), 1)
