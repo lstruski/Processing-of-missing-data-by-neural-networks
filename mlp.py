@@ -42,7 +42,7 @@ def nr(mu, sigma):
     nr_values = sqrt_sigma * (tf.div(tf.exp(tf.div(-tf.square(w), 2.)), np.sqrt(2 * np.pi)) +
                               tf.multiply(tf.div(w, 2.), 1 + tf.erf(tf.div(w, np.sqrt(2)))))
 
-    nr_values = tf.where(non_zero, nr_values, (mu - tf.abs(mu)) / 2.)
+    nr_values = tf.where(non_zero, nr_values, (mu + tf.abs(mu)) / 2.)
     return nr_values
 
 
